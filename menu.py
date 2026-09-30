@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import webbrowser
@@ -37,8 +38,14 @@ from typing import Any, DefaultDict, Dict, List, Optional
 try:
     from flask import Flask, render_template_string, request, jsonify
     HAS_FLASK = True
-except ImportError:
+    FLASK_IMPORT_ERROR = None
+except ImportError as exc:
     HAS_FLASK = False
+    FLASK_IMPORT_ERROR = exc
+    Flask = None
+    render_template_string = None
+    request = None
+    jsonify = None
 
 try:
     import requests
@@ -57,7 +64,7 @@ class MinescriptServer:
         self.port = port
         self.chat_log_path = Path(chat_log)
         self.app = Flask(__name__, template_folder="templates") if HAS_FLASK else None
-        
+
         # Settings
         self.op_mode = True
         self.discord_webhook = os.getenv("DISCORD_WEBHOOK", "")
@@ -65,7 +72,7 @@ class MinescriptServer:
         self.tpa_interval_seconds = int(os.getenv("TPA_INTERVAL_SECONDS", "2"))
         self.server_name = "Donut SMP"
         self.player_name = "Steve"
-        
+
         # State tracking
         self.xray_enabled = False
         self.fly_enabled = False
@@ -74,7 +81,7 @@ class MinescriptServer:
         self.tpa_history: DefaultDict[str, List[datetime]] = defaultdict(list)
         self.command_history: List[str] = []
         self.current_players = ["Steve", "Alex", "Notch", "Herobrine", "Pikachu", "Gem", "Enderman", "Creeper"]
-        
+
         self.setup_routes()
 
     def setup_routes(self) -> None:
@@ -131,10 +138,10 @@ class MinescriptServer:
                 x1, y1, z1 = int(data.get("x1", 0)), int(data.get("y1", 64)), int(data.get("z1", 0))
                 x2, y2, z2 = int(data.get("x2", 10)), int(data.get("y2", 74)), int(data.get("z2", 10))
                 mode = data.get("mode", "replace").strip() or "replace"
-                
+
                 command = f"/fill {x1} {y1} {z1} {x2} {y2} {z2} {block} 0 {mode}"
                 self.command_history.append(command)
-                
+
                 volume = abs(x2 - x1 + 1) * abs(y2 - y1 + 1) * abs(z2 - z1 + 1)
                 return {
                     "success": True,
@@ -936,16 +943,18 @@ class MinescriptServer:
     def run(self) -> None:
         """Start the Flask server."""
         if not HAS_FLASK:
-            print("ERROR: Flask is not installed!")
-            print("Install it with: pip install flask")
+            print(f"ERROR: Flask is not installed in this Python environment: {sys.executable}")
+            print(f"Run: {sys.executable} -m pip install flask requests")
+            if FLASK_IMPORT_ERROR:
+                print(f"Import error: {FLASK_IMPORT_ERROR}")
             return
 
         print(f"Starting Minescript server on http://localhost:{self.port}")
         print("Opening browser...")
-        
+
         # Open browser after a short delay to allow server startup
         threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{self.port}")).start()
-        
+
         self.app.run(host="127.0.0.1", port=self.port, debug=False)
 
 
@@ -959,3 +968,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
