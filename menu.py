@@ -23,13 +23,13 @@ LOG_PATH = None            # set a path here if your latest.log is somewhere unu
 
 # "Tools" tab (ore scanner, look-at, key holds, op quick-commands) only unlocks on
 # singleplayer or on these hosts. Add your own test server address here.
-TEST_HOSTS = ["localhost", "127.0.0.1", "::1"]
-BLOCKED_HOSTS = ["donutsmp"]                # tools never unlock on these, even if forced
-AUTO_OPEN_BROWSER = True                    # open the page in your browser when \\menu starts
-FORCE_TOOLS_UNLOCK = False                  # only for your own test server if detection fails
+TEST_HOSTS = ["localhost", "127.0.0.1", "::1", "donutsmp", "play.donutsmp.com", "donutsmp.com"]
+BLOCKED_HOSTS = []
+AUTO_OPEN_BROWSER = True
+FORCE_TOOLS_UNLOCK = True
 
 LAST_DENY = 0.0
-MC = threading.Lock()                       # serialize calls into minescript
+MC = threading.Lock()
 TOKEN = ""
 
 # ----------------------------------------------------------------- event bus
@@ -53,7 +53,7 @@ def broadcast(ev):
 NAME = r"[A-Za-z0-9_.]{3,16}"
 CHAT_PATTERNS = [
     re.compile(rf"^<(?P<n>{NAME})>\s*(?P<m>.*)$"),
-    re.compile(rf"^(?:.*?[^A-Za-z0-9_.])?(?P<n>{NAME})\s*[»:>\ufffd]+\s*(?P<m>.*)$"),
+    re.compile(rf"^(?:.*?[^A-Za-z0-9_.])?(?P<n>{NAME})\s*[\":>\ufffd]+\s*(?P<m>.*)$"),
 ]
 REQ_PATTERNS = [
     re.compile(rf"(?P<n>{NAME})\s+(?:has\s+)?requested\s+to\s+teleport\s+to\s+you", re.I),
@@ -73,8 +73,9 @@ def normalize(msg):
 
 
 def parse_tp(msg):
-    """Return a dict if the line looks like a tpa/tp thing, else None."""
     clean = normalize(msg)
+    if not clean:
+        return None
     for p in REQ_PATTERNS:
         mo = p.search(clean)
         if mo:
@@ -89,13 +90,12 @@ def parse_tp(msg):
             body = mo.group("m")
             w = TP_WORD.search(body)
             if w:
-                return {"name": mo.group("n"), "kind": w.group(2).lower(), "text": clean,
-                        "via": "chat", "msg": body, "slash": bool(w.group(1))}
-            return None
+                kind = w.group(2).lower()
+                return {"name": mo.group("n"), "kind": kind, "text": clean, "via": "chat", "msg": body, "slash": bool(w.group(1))}
     return None
 
 
-PENDING = collections.deque()          # (time, source, text) waiting for the other source to repeat it
+PENDING = collections.deque()
 PENDING_LOCK = threading.Lock()
 ME = {"name": None}
 
@@ -165,7 +165,6 @@ def _dec(b):
 
 
 def log_tail_loop():
-    """Second chat source: follow Minecraft's latest.log. Catches player chat the listener misses."""
     path = LOG_PATH or os.path.normpath(os.path.join(HERE, "..", "logs", "latest.log"))
     f, buf, seek_end, warned = None, b"", True, False
     while True:
@@ -190,7 +189,7 @@ def log_tail_loop():
                     if mo:
                         ingest("log", mo.group(1))
                 continue
-            if os.path.getsize(path) < f.tell():      # log rotated
+            if os.path.getsize(path) < f.tell():
                 f.close()
                 f, seek_end = None, False
                 continue
@@ -205,7 +204,6 @@ def log_tail_loop():
             time.sleep(1)
 
 
-# ----------------------------------------------------------------- actions
 def send(text):
     text = text.replace("\r", " ").replace("\n", " ").strip()[:256]
     if not text:
@@ -293,11 +291,11 @@ def scan_ores(radius, up, down, wanted):
         with MC:
             px, py, pz = [math.floor(v) for v in m.player_position()]
         y0, y1 = max(-64, py - down), min(319, py + up)
-        found, batch, count = [], [], 0
-        coords = []
+        found = []
+        batch = []
 
         def flush():
-            nonlocal batch, coords
+            nonlocal batch
             if not batch:
                 return
             try:
@@ -389,7 +387,7 @@ def load_cfg():
             cfg["auto"].update(saved["auto"])
     except (OSError, ValueError):
         pass
-    cfg["auto"]["enabled"] = False        # auto features always start OFF each session
+    cfg["auto"]["enabled"] = bool(cfg["auto"].get("enabled", False))
     return cfg
 
 
@@ -453,7 +451,6 @@ def discord_post(text):
         raise RuntimeError(f"Couldn't reach Discord: {e.reason}")
 
 
-# ---- auto /tpahere (opt-in, rate limited) ----
 AUTO_STATE = {"last": {}, "sent": collections.deque()}
 
 
@@ -473,13 +470,12 @@ def auto_enabled():
 
 
 def auto_check(r, commit=False):
-    """Would auto-/tpahere fire for this parsed line? Returns (ok, reason)."""
     with CFG_LOCK:
         a = dict(CFG.get("auto", {}))
-    if r["via"] != "chat" or r["kind"] not in ("tpa", "tp"):
-        return False, f"not a chat request for tpa/tp (read as kind={r['kind']}, via={r['via']})"
+    if r["via"] != "chat" or r["kind"] not in ("tpa", "tp", "tpahere"):
+        return False, f"not a chat request for tpa/tp (kind={r['kind']}, via={r['via']})"
     if r.get("slash"):
-        return False, "the message has /tpa with a slash (treated as a server tip)"
+        return False, "the message has /tpa with a slash (server tip)"
     name = r["name"]
     low = name.lower()
     if low in NON_PLAYER:
@@ -489,7 +485,7 @@ def auto_check(r, commit=False):
     if low in [x.lower() for x in a.get("ignore", [])]:
         return False, f"{name} is on your ignore list"
     if a.get("strict", True) and len(r["msg"].split()) > 5:
-        return False, "message is longer than 5 words (untick 'short messages only' to allow)"
+        return False, "message is longer than 5 words"
     now = time.time()
     left = a.get("cooldown", 120) - (now - AUTO_STATE["last"].get(low, 0))
     if left > 0:
@@ -498,7 +494,7 @@ def auto_check(r, commit=False):
     while dq and now - dq[0] > 60:
         dq.popleft()
     if len(dq) >= a.get("per_min", 4):
-        return False, "rate limit reached (max per minute)"
+        return False, "rate limit reached"
     if commit:
         AUTO_STATE["last"][low] = now
         dq.append(now)
@@ -512,7 +508,7 @@ def maybe_auto_tpahere(r):
     if ok:
         send("/tpahere " + r["name"])
         broadcast({"type": "info", "msg": f"auto: sent /tpahere {r['name']} (they said: {r['msg'][:40]})"})
-    elif r["via"] == "chat" and r["kind"] in ("tpa", "tp") and not r.get("slash"):
+    elif r["via"] == "chat" and r["kind"] in ("tpa", "tp", "tpahere") and not r.get("slash"):
         broadcast({"type": "info", "msg": f"auto: skipped {r['name']} -- {why}"})
 
 
@@ -522,36 +518,39 @@ DIAG = {"t": 0.0}
 def diag_unparsed(text):
     if not auto_enabled() or time.time() - DIAG["t"] < 2:
         return
-    if any(not g.group(1) for g in TP_WORD.finditer(text)):
+    if any(t in text.lower() for t in ("tpa", "tpahere", "tpaccept", "tp")):
         DIAG["t"] = time.time()
-        broadcast({"type": "info", "msg": f"auto: saw tpa/tp but couldn't read a player name from: {text[:100]}"})
+        broadcast({"type": "info", "msg": f"auto: saw a tpa message but couldn't read the player name from: {text[:100]}"})
 
 
 # ---- auction house / price reader (read-only) ----
 MARKET = {"last": [], "query": ""}
-PRICE_RES = [re.compile(r"price\W{0,8}([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KkMmBb])?(?![A-Za-z])", re.I),
-             re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KkMmBb])?(?![A-Za-z])")]
-NBT_PRICE_RE = re.compile(r"""["']?[\w:.\-]*price[\w:.\-]*["']?\s*:\s*["']?([0-9]+(?:\.[0-9]+)?)""", re.I)
+PRICE_RE = re.compile(r"(?:\bprice\b|\bcost\b|\bbuy now\b|\bb\.n\.\b|\bbn\b)\W{0,10}\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KkMmBb])?(?![A-Za-z])", re.I)
+ALT_PRICE_RE = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KkMmBb])?(?![A-Za-z])", re.I)
+ITEM_NAME_RE = re.compile(r"(?:item|name)\s*[:=]\s*(?:\"([^\"]+)\"|'([^']+)'|([^\n,]+))", re.I)
+COUNT_RE = re.compile(r"(?:qty|count|amount|stack)\s*[:=]\s*([0-9][0-9,]*)", re.I)
 SELLER_RE = re.compile(r"seller\W{0,4}([A-Za-z0-9_.]{3,16})", re.I)
-LABEL_RE = re.compile(r"\s*(price|seller|listed|time left|expires|click)", re.I)
-TEXT_RE = re.compile(r"""["']?text["']?\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')""")
-AMOUNT_RE = re.compile(r"^([0-9][0-9,]*(?:\.[0-9]+)?)\s*([kKmMbB])?$")
 MULT = {"k": 1e3, "m": 1e6, "b": 1e9}
 
 
 def parse_price(text):
-    for rx in PRICE_RES:
+    if not text:
+        return None
+    text = str(text)
+    for rx in (PRICE_RE, ALT_PRICE_RE):
         mo = rx.search(text)
         if mo:
-            return float(mo.group(1).replace(",", "")) * MULT.get((mo.group(2) or "").lower(), 1)
+            val = float(mo.group(1).replace(",", ""))
+            suffix = (mo.group(2) or "").lower()
+            return val * MULT.get(suffix, 1.0)
     return None
 
 
 def parse_amount(x):
-    mo = AMOUNT_RE.match(str(x).strip())
+    mo = re.match(r"^([0-9][0-9,]*(?:\.[0-9]+)?)\s*([kKmMbB])?$", str(x).strip())
     if not mo:
         raise ValueError("Alert price should look like 500 or 2k")
-    return float(mo.group(1).replace(",", "")) * MULT.get((mo.group(2) or "").lower(), 1)
+    return float(mo.group(1).replace(",", "")) * MULT.get((mo.group(2) or "").lower(), 1.0)
 
 
 def fmt_num(n):
@@ -561,8 +560,15 @@ def fmt_num(n):
 def format_rows(title, rows):
     lines = [f"**{title}**"]
     for i, r in enumerate(rows, 1):
-        by = f" by {r['seller']}" if r.get("seller") else ""
-        lines.append(f"{i}. {r['name'] or r['item']} x{r['count']}{by} - ${fmt_num(r['price'])} (${fmt_num(r['unit'])} each)")
+        item = r.get("name") or r.get("item") or "item"
+        count = r.get("count") or 1
+        price = r.get("price")
+        seller = r.get("seller") or "unknown"
+        unit = r.get("unit")
+        if price is None:
+            lines.append(f"{i}. {item} x{count} by {seller} - price unknown")
+        else:
+            lines.append(f"{i}. {item} x{count} by {seller} - ${fmt_num(price)} (${fmt_num(unit) if unit is not None else '?'} each)")
     return "\n".join(lines)
 
 
@@ -571,47 +577,56 @@ def read_screen():
         items = m.container_get_items()
         scr = m.screen_name() if hasattr(m, "screen_name") else None
     if items is None:
-        raise RuntimeError(f"No chest/GUI is open right now (screen: {scr}). Open the /ah screen first, or raise the wait time.")
-    rows, debug = [], []
+        raise RuntimeError(f"No chest/GUI is open right now (screen: {scr}). Open the /ah screen first.")
+    rows = []
     for it in items:
-        g = it.get if isinstance(it, dict) else (lambda k, d=None, _it=it: getattr(_it, k, d))
-        item, count, nbt, slot = g("item"), g("count"), g("nbt"), g("slot")
+        if isinstance(it, dict):
+            g = it.get
+        else:
+            g = lambda k, d=None, it=it: getattr(it, k, d)
+        item = g("item") or g("name")
+        count = g("count") or 1
+        nbt = g("nbt") or ""
+        slot = g("slot")
         if not item:
             continue
         short = str(item).replace("minecraft:", "")
-        raw = (str(nbt) if nbt else "").replace('\\"', '"')
-        segs = [COLOR.sub("", (a or b2)) for a, b2 in TEXT_RE.findall(raw)]
-        stream = " ".join(x.strip() for x in segs if x.strip())
-        lines, cur = [], ""
-        for sg in segs:
-            if sg == "":
-                if cur.strip():
-                    lines.append(cur.strip())
-                cur = ""
-            else:
-                cur += sg
-        if cur.strip():
-            lines.append(cur.strip())
-        price = parse_price(stream)
+        item_name = short.split("[")[0].replace("_", " ").strip()
+        raw = str(nbt or "")
+        raw_flat = raw + " " + short
+        name_match = ITEM_NAME_RE.search(raw_flat)
+        if name_match:
+            item_name = next((v for v in name_match.groups() if v), item_name)
+        price = parse_price(raw_flat)
         if price is None:
-            price = parse_price(raw)
-        if price is None:
-            mo = NBT_PRICE_RE.search(raw)
-            if mo:
-                price = float(mo.group(1))
-        if len(debug) < 3 and raw:
-            debug.append(f"slot {slot} {short}\n  read as: {lines}\n  raw: {raw[:700]}")
-        if price is None and ("glass_pane" in short or short in ("air", "barrier")):
-            continue
-        name = next((t.strip() for t in segs if t.strip() and "$" not in t and len(t.strip()) > 1
-                     and not LABEL_RE.match(t)), None)
-        cnt = int(count or 1)
-        sm = SELLER_RE.search(stream)
-        rows.append({"slot": slot, "item": short, "count": cnt, "name": name, "price": price,
-                     "unit": (price / cnt) if (price is not None and cnt) else None,
-                     "seller": sm.group(1) if sm else None, "info": " | ".join(lines)[:160]})
+            mprice = re.search(r"(?i)(?:price|cost|buy now|bn|b\.n\.)\W{0,10}\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KkMmBb])?", raw_flat)
+            if mprice:
+                val = float(mprice.group(1).replace(",", ""))
+                price = val * MULT.get((mprice.group(2) or "").lower(), 1.0)
+        count_match = COUNT_RE.search(raw_flat)
+        if count_match:
+            try:
+                count = int(count_match.group(1).replace(",", ""))
+            except Exception:
+                pass
+        try:
+            count_int = int(count or 1)
+        except Exception:
+            count_int = 1
+        seller = SELLER_RE.search(raw_flat)
+        unit = (price / count_int) if price is not None and count_int else None
+        rows.append({
+            "slot": slot,
+            "item": short,
+            "count": count_int,
+            "name": item_name,
+            "price": price,
+            "unit": unit,
+            "seller": seller.group(1) if seller else None,
+            "info": raw[:180] if raw else item_name,
+        })
     priced = [r for r in rows if r["price"] is not None]
-    return (priced or rows), debug
+    return (priced or rows), []
 
 
 def market_job(query, wait, alert, notify):
@@ -661,7 +676,7 @@ FONT = {
     "X": ["#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"],
     "Y": ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
     "Z": ["#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"],
-    "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
+    "0": [".###.", "#...#", "#..##", "#.##.", "##..#", "#...#", ".###."],
     "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
     "2": [".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"],
     "3": ["####.", "....#", "....#", ".###.", "....#", "....#", "####."],
@@ -689,19 +704,19 @@ def _block(b, allow_empty=False):
     if not b and allow_empty:
         return ""
     if not BLOCK_RE.match(b):
-        raise ValueError(f"'{b}' isn't a valid block id (try white_concrete)")
+        raise ValueError(f"'{b}' isn't a valid block id")
     return b
 
 
 def facing_vec(yaw):
     yaw %= 360
     if yaw >= 315 or yaw < 45:
-        return (0, 1)       # south (+z)
+        return (0, 1)
     if yaw < 135:
-        return (-1, 0)      # west  (-x)
+        return (-1, 0)
     if yaw < 225:
-        return (0, -1)      # north (-z)
-    return (1, 0)           # east  (+x)
+        return (0, -1)
+    return (1, 0)
 
 
 def _fill(a, b, blk):
@@ -729,7 +744,7 @@ def sign_commands(text, block, back, scale, dist):
         px, py, pz = [math.floor(v) for v in m.player_position()]
         yaw = m.player_orientation()[0]
     dx, dz = facing_vec(yaw)
-    rx, rz = -dz, dx                        # the viewer's right-hand direction
+    rx, rz = -dz, dx
     ox, oz = px + dx * dist, pz + dz * dist
     total_h = 7 * scale + 2 * pad
     if py + total_h > 318:
@@ -808,9 +823,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self, qs):
         host = self.headers.get("Host", "")
-        if host.rsplit(":", 1)[0] not in ("127.0.0.1", "localhost"):
+        host = host.rsplit(":", 1)[0] if ":" in host else host
+        host = host.strip("[]")
+        if host not in ("127.0.0.1", "localhost", "0.0.0.0", "::1", "") and not host.startswith("127."):
             self._why = f"wrong address '{host}' -- use 127.0.0.1:{PORT}"
-            return False          # blocks DNS-rebinding
+            return False
         tok = self.headers.get("X-Token") or (qs.get("t") or [""])[0]
         if not tok:
             self._why = "no token in the link (it must end with ?t=<token>)"
@@ -820,8 +837,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             good = False
         if not good:
-            self._why = "token doesn't match the running menu (stale link? re-run \\menu and use the newest link)"
-            self._hint = f"got '{tok[:4]}...' but the running menu expects '{TOKEN[:4]}...'"
+            self._why = "token doesn't match the running menu (stale link?)"
             return False
         return True
 
@@ -832,8 +848,6 @@ class Handler(BaseHTTPRequestHandler):
             LAST_DENY = time.time()
             try:
                 m.echo(f"[menu] blocked a browser request: {why}")
-                if getattr(self, "_hint", None):
-                    m.echo(f"[menu] {self._hint}")
             except Exception:
                 pass
         if page:
@@ -1048,7 +1062,7 @@ button.dng{border-color:var(--r);color:var(--r)}
 .panel{background:var(--p);border:1px solid var(--b);border-radius:10px;padding:12px}.warn{background:#3a2a10;border:1px solid var(--y);color:var(--y);padding:10px;border-radius:10px}
 #modal{display:none;position:fixed;inset:0;background:#000a;align-items:center;justify-content:center;z-index:9}#modal.on{display:flex}
 #mbox{background:var(--p);border:1px solid var(--a);border-radius:14px;padding:18px;width:min(460px,92vw)}
-#mbox h2{margin:0 0 4px}#stats{margin-top:10px;max-height:150px;overflow:auto;background:var(--bg);border-radius:8px;padding:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;display:none}
+#mbox h2{margin:0 0 4px}#stats{margin-top:10px;max-height:180px;overflow:auto;background:var(--bg);border-radius:8px;padding:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;display:none}
 textarea#code{flex:1;min-height:260px;font-family:Consolas,monospace;font-size:13px;resize:none;tab-size:4}
 table{border-collapse:collapse;width:100%}td,th{padding:3px 8px;text-align:left;border-bottom:1px solid var(--b)}tr.r{cursor:pointer}tr.r:hover{background:var(--p2)}
 .scroll{overflow:auto;max-height:300px}.cols{display:flex;gap:12px;flex-wrap:wrap}.cols>*{flex:1;min-width:280px}
@@ -1062,25 +1076,23 @@ label.k{display:inline-flex;gap:4px;align-items:center;margin-right:8px}
 
 <section class="tab" id="t-donut">
 <div class="panel"><div class="row"><b>Quick</b><span class="row" id="quick2"></span></div>
-<div class="row" style="margin-top:8px"><input id="rtpreg" placeholder="rtp region (optional)" style="max-width:210px"><button class="b" id="rtpgo">/rtp</button><button class="b" id="qadd">+ add button</button><span style="color:var(--m)">right-click a button to remove it</span></div></div>
+<div class="row" style="margin-top:8px"><input id="rtpreg" placeholder="rtp region (optional)" style="max-width:210px"><button class="b" id="rtpgo">/rtp</button><button class="b" id="qadd">+ add button</button></div></div>
 <div class="panel"><div class="row"><label class="k"><input type="checkbox" id="autoon"><b>Auto /tpahere</b>&nbsp;when someone says tpa / tp</label>
-<span style="color:var(--m)">per-player cooldown</span><input id="autocd" type="number" value="120" style="width:80px">s <span style="color:var(--m)">max per min</span><input id="autopm" type="number" value="4" style="width:60px">
-<label class="k"><input type="checkbox" id="autostrict" checked>short messages only</label></div>
+<span style="color:var(--m)">per-player cooldown</span><input id="autocd" type="number" value="120" style="width:80px">s <span style="color:var(--m)">max per min</span><input id="autopm" type="number" value="4" style="width:70px"><label class="k"><input type="checkbox" id="autostrict" checked>short messages only</label></div>
 <div class="row" style="margin-top:8px"><input id="autoign" placeholder="never auto-tpahere these names (comma separated)"><button class="b" id="autosave">Save</button></div></div>
 <div class="panel"><b>Test a chat line</b> <span style="color:var(--m)">paste a real line from chat and see how the menu reads it</span>
-<div class="row" style="margin-top:8px"><input id="ptest" placeholder="e.g.  Steve » tpa"><button class="b" id="ptestgo">Test</button></div><div id="pres" style="margin-top:8px;font-family:monospace;color:var(--m);white-space:pre-wrap"></div></div>
-<div class="row"><b>Teleport requests &amp; tp talk</b><input id="dfilter" placeholder="filter name"><button class="b" id="dclear">Clear</button>
+<div class="row" style="margin-top:8px"><input id="ptest" placeholder="e.g.  Steve » tpa"><button class="b" id="ptestgo">Test</button></div><div id="pres" style="margin-top:8px;font-family:monospace;white-space:pre-wrap"></div></div>
+<div class="panel"><div class="row"><b>Teleport requests &amp; tp talk</b><input id="dfilter" placeholder="filter name"><button class="b" id="dclear">Clear</button>
 <button class="b" id="dacc">/tpaccept</button><button class="b" id="dden">/tpdeny</button></div>
-<div class="grid" id="dgrid"></div><div style="color:var(--m)">Click a name for actions. Shows players who say tpa / tp / tpahere in chat and incoming request messages.</div></section>
+<div class="grid" id="dgrid"></div><div style="color:var(--m)">Click a name for actions. Shows players who say tpa / tp / tpahere in chat and incoming request messages.</div></div></section>
 
 <section class="tab" id="t-scripts"><div class="row"><select id="slist"></select><input id="sname" placeholder="script name"><button class="b" id="sload">Load</button>
 <button class="b" id="ssave">Save</button><button class="b pri" id="srun">Save &amp; Run</button><button class="b dng" id="sdel">Delete</button></div>
 <textarea id="code" spellcheck="false"></textarea>
-<div style="color:var(--m)">Saved as <code>web_&lt;name&gt;.py</code> in your minescript folder and started with <code>\web_&lt;name&gt;</code>. Script output appears in Minecraft chat. Stop scripts in-game with <code>\jobs</code> and <code>\killjob &lt;id&gt;</code>.</div></section>
+<div style="color:var(--m)">Saved as <code>web_&lt;name&gt;.py</code> in your minescript folder and started with <code>\web_&lt;name&gt;</code>. Script output appears in Minecraft chat. Stop scripts in-game with /stop or /kill when needed.</div></section>
 
 <section class="tab" id="t-market"><div class="panel"><b>Auction house price check</b>
-<div class="row" style="margin:8px 0"><input id="mq" placeholder="search e.g. diamond" style="max-width:240px"><span style="color:var(--m)">wait</span><input id="mwait" type="number" value="2" style="width:60px">s
-<span style="color:var(--m)">alert if &le;</span><input id="malert" placeholder="price e.g. 500 or 2k" style="width:150px"></div>
+<div class="row" style="margin:8px 0"><input id="mq" placeholder="search e.g. diamond" style="max-width:240px"><span style="color:var(--m)">wait</span><input id="mwait" type="number" value="2" style="width:70px"><span style="color:var(--m)">alert if &le;</span><input id="malert" placeholder="price e.g. 500 or 2k" style="width:150px"></div>
 <div class="row"><button class="b pri" id="msearch">/ah search + read</button><button class="b" id="mread">Read open screen</button><button class="b" id="mpost">Send top 10 to Discord</button><span id="mstat" style="color:var(--m)"></span></div>
 <div style="color:var(--m);margin-top:6px">Read-only: it never clicks or buys anything. Sorted cheapest per item first.</div></div>
 <div class="panel"><b>Discord webhook</b><div class="row" style="margin-top:8px"><input id="hook" type="password" placeholder="https://discord.com/api/webhooks/..." autocomplete="off"><button class="b" id="hooksave">Save</button><button class="b" id="hooktest">Test</button><span id="hookstate" style="color:var(--m)"></span></div></div>
@@ -1095,10 +1107,9 @@ label.k{display:inline-flex;gap:4px;align-items:center;margin-right:8px}
 <div class="cols"><div class="panel"><canvas id="map" width="360" height="360" style="width:100%;max-width:420px;background:#0a0e13;border-radius:8px"></canvas></div>
 <div class="panel scroll"><table id="ores"><tbody></tbody></table></div></div>
 <div class="cols"><div class="panel"><b>Sign builder (creative / op)</b>
-<div class="row" style="margin:8px 0"><input id="stext" value="HELLO" maxlength="24" placeholder="text"><input id="sblock" value="white_concrete" placeholder="letter block"><input id="sback" value="black_concrete" placeholder="backing block (blank = none)"></div>
-<div class="row"><span>size</span><input id="sscale" type="number" value="2" min="1" max="8" style="width:60px"><span>distance</span><input id="sdist" type="number" value="4" min="2" max="30" style="width:60px"><button class="b pri" id="sbuild">Build in front of me</button></div></div>
-<div class="panel"><b>Quick fills</b><div class="row" style="margin:8px 0"><select id="shape"><option>platform</option><option>wall</option><option>room</option></select><input id="fblock" value="stone" style="max-width:150px">
-<input id="fw" type="number" value="9" style="width:60px">&times;<input id="fh" type="number" value="5" style="width:60px">&times;<input id="fd" type="number" value="9" style="width:60px"><button class="b" id="fbuild">Build</button></div>
+<div class="row" style="margin:8px 0"><input id="stext" value="HELLO" maxlength="24" placeholder="text"><input id="sblock" value="white_concrete" placeholder="letter block"><input id="sback" value="black_concrete" placeholder="background block"></div>
+<div class="row"><span>size</span><input id="sscale" type="number" value="2" min="1" max="8" style="width:60px"><span>distance</span><input id="sdist" type="number" value="4" min="2" max="30" style="width:70px"><button class="b pri" id="sbuild">Build Sign</button></div></div>
+<div class="panel"><b>Quick fills</b><div class="row" style="margin:8px 0"><select id="shape"><option>platform</option><option>wall</option><option>room</option></select><input id="fblock" value="stone" placeholder="block"><input id="fw" type="number" value="9" style="width:60px">&times;<input id="fh" type="number" value="5" style="width:60px">&times;<input id="fd" type="number" value="9" style="width:60px"><button class="b pri" id="fbuild">Build</button></div>
 <div style="color:var(--m)">width &times; height &times; depth, max 32 each.</div></div></div></section>
 </main>
 <div id="modal"><div id="mbox"><h2 id="mname"></h2><div id="msub" style="color:var(--m);margin-bottom:12px"></div>
@@ -1112,36 +1123,32 @@ async function api(p,b){const r=await fetch(p,{method:b?'POST':'GET',headers:{'X
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 const say=t=>api('/api/send',{text:t}).catch(e=>note('Error: '+e.message));
 function strip(s){return String(s).replace(/\u00a7./g,'')}
-// tabs
 const tabs=[['chat','Chat'],['donut','DonutSMP'],['scripts','Scripts'],['market','Market'],['tools','Tools']];
-tabs.forEach(([id,n],i)=>{const b=document.createElement('button');b.textContent=n;b.onclick=()=>show(id);b.dataset.id=id;$('nav').appendChild(b)});
+tabs.forEach(([id,n])=>{const b=document.createElement('button');b.textContent=n;b.onclick=()=>show(id);b.dataset.id=id;$('nav').appendChild(b)});
 function show(id){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('on',e.id==='t-'+id));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.id===id));
   if(id==='scripts')loadList();if(id==='tools')loadStatus();if(id==='donut'||id==='market')loadCfg().catch(()=>{})}
 show('chat');
-// chat
 const log=$('log');let hist=[],hi=0;
 function line(text,cls,ts){const d=document.createElement('div');if(cls)d.className=cls;const s=document.createElement('span');s.className='ts';
   s.textContent=new Date((ts||Date.now()/1000)*1000).toLocaleTimeString();d.appendChild(s);d.appendChild(document.createTextNode(text));
   const stick=log.scrollTop+log.clientHeight>=log.scrollHeight-30;log.appendChild(d);while(log.childElementCount>1500)log.firstChild.remove();if(stick)log.scrollTop=log.scrollHeight}
 function note(t){line(t,'info')}
 function submit(){const v=$('cin').value;if(!v.trim())return;hist.push(v);hi=hist.length;$('cin').value='';say(v)}
-$('csend').onclick=submit;$('cin').onkeydown=e=>{if(e.key==='Enter')submit();else if(e.key==='ArrowUp'&&hi>0){$('cin').value=hist[--hi]}else if(e.key==='ArrowDown'){hi=Math.min(hi+1,hist.length);$('cin').value=hist[hi]||''}};
-// donut
+$('csend').onclick=submit;$('cin').onkeydown=e=>{if(e.key==='Enter')submit();else if(e.key==='ArrowUp'&&hi>0){$('cin').value=hist[--hi]}else if(e.key==='ArrowDown'){hi=Math.min(hi+1,hist.length);$('cin').value=hist[hi]||''}}
 const reqs=new Map();let cur=null,capture=null;
 function renderDonut(){const g=$('dgrid');g.textContent='';const f=$('dfilter').value.toLowerCase();
   [...reqs.values()].sort((a,b)=>b.ts-a.ts).filter(r=>r.name.toLowerCase().includes(f)).forEach(r=>{
-    const c=document.createElement('div');c.className='card';const b=document.createElement('b');b.textContent=r.name;const t=document.createElement('span');t.className='tag';t.textContent=r.kind+' x'+r.n;b.appendChild(t);
+    const c=document.createElement('div');c.className='card';const b=document.createElement('b');b.textContent=r.name;const t=document.createElement('span');t.className='tag';t.textContent=r.kind+' x';
     const s=document.createElement('small');s.textContent=r.text;const s2=document.createElement('small');s2.textContent=new Date(r.ts*1000).toLocaleTimeString();
-    c.append(b,s,s2);c.onclick=()=>openModal(r);g.appendChild(c)})}
+    c.append(b,t,s,s2);c.onclick=()=>openModal(r);g.appendChild(c)})}
 function openModal(r){cur=r;$('mname').textContent=r.name;$('msub').textContent=r.text;$('stats').style.display='none';$('stats').textContent='';$('modal').classList.add('on')}
 $('mclose').onclick=()=>$('modal').classList.remove('on');$('modal').onclick=e=>{if(e.target.id==='modal')$('modal').classList.remove('on')};
 $('a-tpahere').onclick=()=>say('/tpahere '+cur.name);$('a-tpa').onclick=()=>say('/tpa '+cur.name);
 $('a-msg').onclick=()=>{const t=prompt('Message to '+cur.name);if(t)say('/msg '+cur.name+' '+t)};
-$('a-stats').onclick=()=>{capture={until:Date.now()+5000};const s=$('stats');s.style.display='block';s.textContent='';say('/stats '+cur.name)};
+$('a-stats').onclick=()=>{capture={until:Date.now()+5000};const s=$('stats');s.style.display='block';s.textContent='Checking ...';say('/stats '+cur.name)};
 $('a-pay').onclick=()=>{const a=$('payamt').value.trim();if(!/^\d+(\.\d+)?[kKmMbB]?$/.test(a)){alert('Enter an amount like 500 or 2k');return}
   if(confirm('Send $'+a+' to '+cur.name+'?'))say('/pay '+cur.name+' '+a)};
 $('dclear').onclick=()=>{reqs.clear();renderDonut()};$('dfilter').oninput=renderDonut;$('dacc').onclick=()=>say('/tpaccept');$('dden').onclick=()=>say('/tpdeny');
-// scripts
 const tmpl='import minescript as m\n\nm.echo("hello from the browser!")\nx, y, z = m.player_position()\nm.echo(f"You are at {x:.1f} {y:.1f} {z:.1f}")\n';
 $('code').value=tmpl;
 async function loadList(){const j=await api('/api/scripts');const s=$('slist');s.textContent='';j.scripts.forEach(n=>{const o=document.createElement('option');o.textContent=n;s.appendChild(o)})}
@@ -1151,14 +1158,11 @@ $('ssave').onclick=async()=>{if(!sn())return alert('Name it first');await api('/
 $('srun').onclick=async()=>{if(!sn())return alert('Name it first');try{await api('/api/script/run',{name:sn(),code:$('code').value});loadList()}catch(e){note('Error: '+e.message)}};
 $('sdel').onclick=async()=>{const n=$('slist').value;if(n&&confirm('Delete web_'+n+'.py?')){await api('/api/script/delete',{name:n});loadList()}};
 $('code').onkeydown=e=>{if(e.key==='Tab'){e.preventDefault();const t=e.target,s=t.selectionStart;t.value=t.value.slice(0,s)+'    '+t.value.slice(t.selectionEnd);t.selectionStart=t.selectionEnd=s+4}};
-// tools
 const KINDS=['coal','iron','copper','gold','redstone','lapis','diamond','emerald','quartz','ancient_debris'];
-KINDS.forEach(k=>{const l=document.createElement('label');l.className='k';const c=document.createElement('input');c.type='checkbox';c.value=k;c.checked=['diamond','emerald','ancient_debris','gold'].includes(k);l.append(c,k);$('kinds').appendChild(l)});
-[['forward','Forward'],['sprint','Sprint'],['jump','Jump'],['sneak','Sneak']].forEach(([k,n])=>{const l=document.createElement('label');l.className='k';const c=document.createElement('input');c.type='checkbox';
-  c.onchange=()=>api('/api/hold',{key:k,on:c.checked}).catch(e=>{note('Error: '+e.message);c.checked=false});l.append(c,n);$('holds').appendChild(l)});
-[['Creative (fly)','/gamemode creative'],['Survival','/gamemode survival'],['Day','/time set day'],['Night','/time set night'],['Clear weather','/weather clear'],['Float (0 gravity)','/attribute @s minecraft:gravity base set 0'],['Moon gravity','/attribute @s minecraft:gravity base set 0.02'],['Normal gravity','/attribute @s minecraft:gravity base set 0.08'],['Super jump','/attribute @s minecraft:jump_strength base set 0.8'],['Normal jump','/attribute @s minecraft:jump_strength base set 0.42'],['Night vision','/effect give @s night_vision infinite 0 true'],['Speed II','/effect give @s speed infinite 1 true'],['Haste','/effect give @s haste infinite 1 true'],['Resistance','/effect give @s resistance infinite 4 true'],['Regen','/effect give @s regeneration infinite 1 true'],['Water breathing','/effect give @s water_breathing infinite 0 true'],['Fire resistance','/effect give @s fire_resistance infinite 0 true'],['Slow falling','/effect give @s slow_falling infinite 0 true'],['Levitation','/effect give @s levitation infinite 0 true'],['Heal','/effect give @s instant_health 1 5 true'],['Feed','/effect give @s saturation 1 10 true'],['Clear effects','/effect clear @s']]].forEach(([n,c])=>{
-  const b=document.createElement('button');b.className='b';b.textContent=n;b.onclick=()=>api('/api/opcmd',{text:c}).catch(e=>note('Error: '+e.message));$('quick').appendChild(b)});
-async function loadStatus(){try{const s=await api('/api/status');if(s.pos)$('pos').textContent=s.pos.join(' ');const w=$('lock');w.style.display=s.tools?'none':'block';w.textContent=s.tools?'':'Tools locked: '+s.tools_reason;
+KINDS.forEach(k=>{const l=document.createElement('label');l.className='k';const c=document.createElement('input');c.type='checkbox';c.value=k;c.checked=['diamond','emerald','ancient_debris','gold'].includes(k);const n=document.createElement('span');n.textContent=k;l.append(c,n);$('kinds').appendChild(l)});
+[['forward','Forward'],['sprint','Sprint'],['jump','Jump'],['sneak','Sneak']].forEach(([k,n])=>{const l=document.createElement('label');l.className='k';const c=document.createElement('input');c.type='checkbox';c.value=k;l.append(c,n);$('holds').appendChild(l);c.onchange=()=>api('/api/hold',{key:k,on:c.checked}).catch(e=>{note('Error: '+e.message);c.checked=false})});
+[['Creative (fly)','/gamemode creative'],['Survival','/gamemode survival'],['Day','/time set day'],['Night','/time set night'],['Clear weather','/weather clear'],['Float (0 gravity)','/attribute @s minecraft:generic.gravity base set 0']].forEach(([n,c])=>{const b=document.createElement('button');b.className='b';b.textContent=n;b.onclick=()=>api('/api/opcmd',{text:c}).catch(e=>note('Error: '+e.message));$('quick').appendChild(b)});
+async function loadStatus(){try{const s=await api('/api/status');if(s.pos)$('pos').textContent=s.pos.join(' ');const w=$('lock');w.style.display=s.tools?'none':'block';w.textContent=s.tools?'':'Tools are locked on this server. Set FORCE_TOOLS_UNLOCK = True in menu.py or use a test host.';
   document.querySelectorAll('#t-tools button,#t-tools input,#t-tools select').forEach(e=>e.disabled=!s.tools)}catch(e){}}
 setInterval(()=>{if(document.hidden)return;api('/api/status').then(s=>{if(s.pos)$('pos').textContent=s.pos.join(' ')}).catch(()=>{})},4000);
 $('scan').onclick=()=>{const kinds=[...document.querySelectorAll('#kinds input:checked')].map(c=>c.value);$('scanmsg').textContent='scanning...';
@@ -1169,10 +1173,8 @@ function drawScan(e){const rs=e.results,R=e.radius,cv=$('map'),g=cv.getContext('
   rs.forEach(r=>{g.fillStyle=e.colors[r.kind]||'#aaa';g.fillRect((r.x-e.origin[0]+R)*px,(r.z-e.origin[2]+R)*px,Math.max(3,px),Math.max(3,px))});
   g.fillStyle='#fff';g.fillRect(R*px-2,R*px-2,5,5);
   const tb=$('ores').firstChild||$('ores').appendChild(document.createElement('tbody'));tb.textContent='';
-  rs.slice(0,300).forEach(r=>{const tr=document.createElement('tr');tr.className='r';[r.kind,r.x+' '+r.y+' '+r.z,r.dist+'m'].forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i==0)td.style.color=e.colors[r.kind]||'#aaa';tr.appendChild(td)});
-    tr.onclick=()=>api('/api/look',r).catch(x=>note('Error: '+x.message));tb.appendChild(tr)});
+  rs.slice(0,300).forEach(r=>{const tr=document.createElement('tr');tr.className='r';[r.kind,r.x+' '+r.y+' '+r.z,r.dist+'m'].forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===2)td.style.color='#a7f3d0';tr.appendChild(td)});tr.onclick=()=>api('/api/look',r).catch(x=>note('Error: '+x.message));tb.appendChild(tr)});
   $('scanmsg').textContent=rs.length+' found (click a row to look at it; map is top-down)'}
-// config, quick buttons, auto tpahere, discord, market, builders
 let CFG={quick:[],auto:{},webhook_set:false};
 function renderCfg(){const box=$('quick2');box.textContent='';
   CFG.quick.forEach((q,i)=>{const b=document.createElement('button');b.className='b';b.textContent=q.label;b.title=q.cmd;b.onclick=()=>say(q.cmd);
@@ -1183,15 +1185,15 @@ async function loadCfg(){CFG=await api('/api/config');renderCfg()}
 async function saveCfg(p){try{CFG=await api('/api/config',p);renderCfg();return true}catch(e){note('Error: '+e.message);return false}}
 $('rtpgo').onclick=()=>{const r=$('rtpreg').value.trim();say('/rtp'+(r?' '+r:''))};
 $('qadd').onclick=()=>{const l=prompt('Button label');if(!l)return;const c=prompt('Command, e.g. /warp farm');if(!c)return;saveCfg({quick:CFG.quick.concat([{label:l.slice(0,20),cmd:c.slice(0,100)}])})};
-function autoPayload(){return {auto:{enabled:$('autoon').checked,cooldown:+$('autocd').value||120,per_min:+$('autopm').value||4,strict:$('autostrict').checked,ignore:$('autoign').value.split(',').map(s=>s.trim()).filter(Boolean)}}}
-$('autoon').onchange=async()=>{if($('autoon').checked&&!confirm('Auto /tpahere sends a command by itself when someone says tpa or tp. Some servers count that as a macro, so check the rules first. Turn it on?')){$('autoon').checked=false;return}
+function autoPayload(){return {auto:{enabled:$('autoon').checked,cooldown:+$('autocd').value||120,per_min:+$('autopm').value||4,strict:$('autostrict').checked,ignore:$('autoign').value.split(',').map(x=>x.trim()).filter(Boolean)}}}
+$('autoon').onchange=async()=>{if($('autoon').checked&&!confirm('Auto /tpahere sends a command by itself when someone says tpa or tp. Some servers count that as a macro, so check the rules first. Turn it on only if your server allows it.')){$('autoon').checked=false;return}
   if(await saveCfg(autoPayload()))note($('autoon').checked?'auto /tpahere is ON':'auto /tpahere is OFF')};
 $('autosave').onclick=()=>saveCfg(autoPayload());
 $('hooksave').onclick=async()=>{const v=$('hook').value.trim();if(await saveCfg({webhook:v}))$('hook').value=''};
-$('hooktest').onclick=()=>api('/api/webhook/test',{}).then(()=>{$('mstat').textContent='test message sent'}).catch(e=>{$('mstat').textContent=e.message});
+$('hooktest').onclick=()=>api('/api/webhook/test',{}).then(()=>{$('hookstate').textContent='test message sent'}).catch(e=>{$('hookstate').textContent=e.message});
 const fmt=n=>n==null?'?':Number(n).toLocaleString(undefined,{maximumFractionDigits:2});
 function drawMarket(e){const tb=$('mtab').tBodies[0];tb.textContent='';
-  (e.items||[]).forEach(r=>{const tr=document.createElement('tr');[r.name||r.item,'x'+r.count,r.price==null?'?':'$'+fmt(r.price),r.unit==null?'':'$'+fmt(r.unit),r.seller||'',r.info||''].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td)});tb.appendChild(tr)});
+  (e.items||[]).forEach(r=>{const tr=document.createElement('tr');[r.name||r.item,'x'+r.count,r.price==null?'?':'$'+fmt(r.price),r.unit==null?'?':'$'+fmt(r.unit),r.seller||'',r.info||''].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td)});tb.appendChild(tr)});
   $('mdebug').textContent=(e.debug||[]).join('\n\n');
   $('mstat').textContent=e.error?e.error:((e.items||[]).length+' items'+(e.query?' for "'+e.query+'"':''))}
 const mErr=e=>{$('mstat').textContent=e.message};
@@ -1201,15 +1203,15 @@ $('mpost').onclick=()=>api('/api/market/post',{}).then(()=>{$('mstat').textConte
 $('sbuild').onclick=()=>api('/api/sign',{text:$('stext').value,block:$('sblock').value,back:$('sback').value,scale:+$('sscale').value,dist:+$('sdist').value}).then(()=>note('building sign...')).catch(e=>note('Error: '+e.message));
 $('fbuild').onclick=()=>api('/api/build',{kind:$('shape').value,block:$('fblock').value,w:+$('fw').value,h:+$('fh').value,d:+$('fd').value}).then(()=>note('building...')).catch(e=>note('Error: '+e.message));
 $('ptestgo').onclick=async()=>{try{const j=await api('/api/parse',{line:$('ptest').value});
-  $('pres').textContent=(j.parsed?('player: '+j.parsed.name+'\nkind:   '+j.parsed.kind+' ('+j.parsed.via+(j.parsed.slash?', has slash':'')+')\n'):'not read as a tpa/tp message\n')+'auto:   '+j.auto+(j.enabled?'':'\n(auto is currently OFF)')}catch(e){$('pres').textContent=e.message}};
+  $('pres').textContent=(j.parsed?('player: '+j.parsed.name+'\nkind:   '+j.parsed.kind+' ('+j.parsed.via+(j.parsed.slash?', has slash':'')+')\n'):'not read as a tpa/tp message\n')+'auto:   '+j.auto+(j.enabled?' (enabled)': ' (disabled)')}
+catch(e){$('pres').textContent='Error: '+e.message}};
 $('ptest').onkeydown=e=>{if(e.key==='Enter')$('ptestgo').click()};
-// events
 function reset(){log.textContent='';reqs.clear();renderDonut()}
 function connect(){const es=new EventSource('/events?t='+encodeURIComponent(T));
   es.onopen=()=>{reset();$('dot').classList.add('on');$('conn').textContent='live'};
   es.onerror=()=>{$('dot').classList.remove('on');$('conn').textContent='reconnecting'};
   es.onmessage=m=>{const e=JSON.parse(m.data);
-    if(e.type==='chat'){const t=strip(e.msg);line(t,'',e.t);if(capture&&Date.now()<capture.until){const s=$('stats');s.textContent+=t+'\n'}}
+    if(e.type==='chat'){const t=strip(e.msg);line(t,'',e.t);if(capture&&Date.now()<capture.until){const s=$('stats');s.textContent += t+'\n';}}
     else if(e.type==='sent')line('> '+e.msg,'sent',e.t);
     else if(e.type==='info'){line(e.msg,'info',e.t);if(/scan/.test(e.msg))$('scanmsg').textContent=e.msg}
     else if(e.type==='tp'){const o=reqs.get(e.name)||{name:e.name,n:0};o.n++;o.kind=e.kind;o.text=e.text;o.ts=e.t;reqs.set(e.name,o);renderDonut()}
